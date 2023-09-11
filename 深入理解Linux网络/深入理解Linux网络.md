@@ -475,3 +475,145 @@ tatic int inet_create(struct net *net, struct socket *sock, int protocol,
 
 4. sock_init_data方法将sock中的sk_data_ready函数指针进行了初始化;当软中断上收到数据包时会通过调用sk_data_ready函数指针来唤醒sock上等待的进程
 ![img](assets.assets/3.3.png)
+
+## 内核和用户进程协作之阻塞方式
+![img](assets.assets/3.4.png)
+
+### 等待接收消息
+1. 根据用户传入的fd找到对应的socket对象
+```
+//file: net/socket.c
+SYSCALL_DEFINE6(recvfrom, int, fd, void __user *, ubuf, size_t, size,
+  unsigned int, flags, struct sockaddr __user *, addr,
+  int __user *, addr_len)
+{
+    struct socket *sock;
+
+    //根据用户传入的 fd 找到 socket 对象
+    sock = sockfd_lookup_light(fd, &err, &fput_needed);
+    ......
+    err = sock_recvmsg(sock, &msg, size, flags);
+    ......
+}
+
+static inline int __sock_recvmsg_nosec(struct kiocb *iocb, struct socket *sock,
+           struct msghdr *msg, size_t size, int flags)
+{
+    ......
+    return sock->ops->recvmsg(iocb, sock, msg, size, flags);
+}
+```
+2. 调用socket里的ops里的recvmsg，其指向inet_recvmsg方法
+![img](assets.assets/3.6.png)
+3. 接着调用socket对象里的sk_prot下的recvmsg方法
+```
+//file: net/ipv4/tcp.c
+int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+  size_t len, int nonblock, int flags, int *addr_len)
+{
+    int copied = 0;
+    ...
+    do {
+        //遍历接收队列接收数据
+        skb_queue_walk(&sk->sk_receive_queue, skb) {
+        ...
+    }
+    ...
+    }
+
+    if (copied >= target) {
+        release_sock(sk);
+        lock_sock(sk);
+    } else //没有收到足够数据，启用 sk_wait_data 阻塞当前进程
+        sk_wait_data(sk, &timeo);
+}
+```
+![img](assets.assets/3.7.png)
+4. skb_queue_walk在访问sock对象下的接收队列，如果为空，调用sk_wait_data把当前进程设置为阻塞帧
+5. sk_wait_data是怎么将当前进程阻塞掉的：
+   1. 在DEFINE_WAIT宏下，定义了一个等待队列wait
+   2. 在这个新的等待队列上，注册了回调函数autoremove_wake_function，并把当前进程描述符current关联到其.private成员上
+   3. 紧接着在sk_wait_data中调用sk_sleep获取sock对象下的等待队列表头wait_queue_head_t
+6. 这样后面当内核收完数据产生就绪事件的事件，就可以查找socket等待队列上的等待项，进而可以找到回调函数和在等待该socket就绪事件的进程了
+![img](assets.assets/3.8.png)
+![img](assets.assets/3.5.png) 
+
+
+### 软中断模块
+- Linux里ksoftirqd线程收到数据包，如发现是TCP包就会执行tcp_v4_rcv
+- 在tcp_v4_rcv中，首先根据收到的网络包的header里的source和dest信息在本机上查询对应的socket，之后进入主体函数tcp_v4_do_rcv
+```
+// file: net/ipv4/tcp_ipv4.c
+int tcp_v4_rcv(struct sk_buff *skb)
+{
+    ......
+    th = tcp_hdr(skb); //获取tcp header
+    iph = ip_hdr(skb); //获取ip header
+
+    //根据数据包 header 中的 ip、端口信息查找到对应的socket
+    sk = __inet_lookup_skb(&tcp_hashinfo, skb, th->source, th->dest);
+    ......
+
+    //socket 未被用户锁定
+    if (!sock_owned_by_user(sk)) {
+    {
+    if (!tcp_prequeue(sk, skb))
+    ret = tcp_v4_do_rcv(sk, skb);
+    }
+    }
+}
+
+//file: net/ipv4/tcp_ipv4.c
+int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
+{
+    if (sk->sk_state == TCP_ESTABLISHED) { 
+
+    //执行连接状态下的数据处理
+    if (tcp_rcv_established(sk, skb, tcp_hdr(skb), skb->len)) 
+    {
+        rsk = sk;
+        goto reset;
+    }
+        return 0;
+    }
+
+    //其它非 ESTABLISH 状态的数据包处理
+    ......
+}
+```
+- 假设处理的是TSTABLISH状态下的包
+```
+//file: net/ipv4/tcp_input.c
+int tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
+   const struct tcphdr *th, unsigned int len)
+{
+    ......
+
+    //接收数据到队列中
+    eaten = tcp_queue_rcv(sk, skb, tcp_header_len,
+                &fragstolen);
+
+    //数据 ready，唤醒 socket 上阻塞掉的进程
+    sk->sk_data_ready(sk, 0);
+}
+```
+![img](assets.assets/3.10.png)
+
+- 调用tcp_queue_rcv接收完成后，接着调用sk_data_ready来唤醒socket上等待的用户进程，这是一个函数指针，唤醒等待的进程
+
+### 同步阻塞总结
+- 第一部分是我们自己代码所在的进程
+  1. 调用socket()函数会进入内核态创建必要的内核对象
+  2. recv()函数进入内核态以后负责查看接收队列，以及在没有数据可以处理的时候把当前进程阻塞掉
+- 第二部分是硬中断、软中断上下文
+  1. 将包处理完后会放在socket的接收队列中
+  2. 根据socket内核对象找到其等待队列中正在因为等待而被阻塞的进程，将其唤醒
+
+![img](assets.assets/3.12.png)
+
+## 内核和用户进程协作之epoll
+- 在Linux上多路复用的方案select、poll、epoll
+
+### epoll内核对象的创建
+- 当用户进程调用epoll_create时，内核会创建一个struct eventpoll的内核对象，并把它关联到当前进程的已打开文件列表中
+![img](assets.assets/3.14.jpg)
