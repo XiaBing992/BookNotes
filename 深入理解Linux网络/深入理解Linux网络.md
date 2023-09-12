@@ -617,3 +617,151 @@ int tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
 ### epoll内核对象的创建
 - 当用户进程调用epoll_create时，内核会创建一个struct eventpoll的内核对象，并把它关联到当前进程的已打开文件列表中
 ![img](assets.assets/3.14.jpg)
+![img](assets.assets/3.15.jpg)
+```
+//file: fs/eventpoll.c
+SYSCALL_DEFINE1(epoll_creat1, int, flags)
+{
+    struct eventpoll *ep = NULL;
+
+    //创建一个eventpoll对象
+    error = ep_alloc(&ep);
+}
+
+struct eventpoll
+{
+    //sys_epoll_wait用的等待队列
+    wait_queue_head_t wq;
+    
+    //接收就绪的描述符
+    struct list_head rdlist;
+
+    //每个epoll对象中都有一个红黑树
+    struct rb_root rbr;
+
+    ......
+}
+```
+- eventpoll 结构体中的几个成员的含义如下：
+  - wq: 等待队列链表；软中断数据就绪的时候会通过wq来找到阻塞在epoll对象上的用户进程
+  - rbr: 红黑树；为了支持连接的高效查找、插入和删除，通过这颗树来管理用户进程下添加进来的所有socket连接
+  - rdllist: 就绪的描述符的链表
+
+- 在这个结构申请完后，在ep_alloc中完成初始化：
+```cpp
+static int ep_alloc(struct eventpoll **pep)
+{
+    struct eventpoll *ep;
+
+    //申请eventpoll内存
+    ep = kzalloc(sizeof(*ep), GFP_KERNEL);
+
+    //初始化等待队列头
+    init_waitqueue_head(&ep->wq);
+
+    //初始化就绪列表
+    INIT_LIST_HEAD(&ep->rdllist);
+
+    //初始化红黑树指针
+    ep->rbr = RB_ROOT;
+}
+```
+
+### 为epoll添加socket
+- 在epoll_ctl注册每一个socket的时候，内核会做三件事：
+  1. 分配一个红黑树结点对象epitem
+  2. 将等待事件添加到socket的等待队列中，回调函数为ep_poll_callback
+  3. 将epitem插入epoll对象的红黑树
+
+- 通过epoll_ctl添加两个socket以后，这些内核数据结构最终在进程中的关系：
+![img](assets.assets/3.16.png)
+
+- 详细解析socket是如何添加到epoll对象里的
+```cpp
+// file：fs/eventpoll.c
+SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
+        struct epoll_event __user *, event)
+{
+    struct eventpoll *ep;
+    struct file *file, *tfile;
+
+    //根据 epfd 找到 eventpoll 内核对象
+    file = fget(epfd);
+    ep = file->private_data;
+
+    //根据 socket 句柄号， 找到其 file 内核对象
+    tfile = fget(fd);
+
+    switch (op) {
+    case EPOLL_CTL_ADD:
+        if (!epi) {
+            epds.events |= POLLERR | POLLHUP;
+            error = ep_insert(ep, &epds, tfile, fd);
+        } else
+            error = -EEXIST;
+        clear_tfile_check_list();
+        break;
+        ......
+    }
+    ......
+}
+```
+- 对于ep_insert函数，所有注册都是这个函数中完成的
+```
+//file: fs/eventpoll.c
+static int ep_insert(struct eventpoll *ep, 
+                struct epoll_event *event,
+                struct file *tfile, int fd)
+{
+    //3.1 分配并初始化 epitem
+    //分配一个epi对象
+    struct epitem *epi;
+    if (!(epi = kmem_cache_alloc(epi_cache, GFP_KERNEL)))
+        return -ENOMEM;
+
+    //对分配的epi进行初始化
+    //epi->ffd中存了句柄号和struct file对象地址
+    INIT_LIST_HEAD(&epi->pwqlist);
+    epi->ep = ep;
+    ep_set_ffd(&epi->ffd, tfile, fd);
+
+    //3.2 设置 socket 等待队列
+    //定义并初始化 ep_pqueue 对象
+    struct ep_pqueue epq;
+    epq.epi = epi;
+    init_poll_funcptr(&epq.pt, ep_ptable_queue_proc);
+
+    //调用 ep_ptable_queue_proc 注册回调函数 
+    //实际注入的函数为 ep_poll_callback
+    revents = ep_item_poll(epi, &epq.pt);
+
+    ......
+    //3.3 将epi插入到 eventpoll 对象中的红黑树中
+    ep_rbtree_insert(ep, epi);
+    ......
+}
+```
+  1. 分配并初始化epitem
+```
+//file: fs/eventpoll.c
+struct epitem {
+
+    //红黑树节点
+    struct rb_node rbn;
+
+    //socket文件描述符信息
+    struct epoll_filefd ffd;
+
+    //所归属的 eventpoll 对象
+    struct eventpoll *ep;
+
+    //等待队列
+    struct list_head pwqlist;
+}
+```
+![img](assets.assets/3.17.png)
+  2. 设置socket等待队列
+  3. 插入红黑树
+
+### epoll_wait之等待接收
+ 
