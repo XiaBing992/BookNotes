@@ -760,8 +760,171 @@ struct epitem {
 }
 ```
 ![img](assets.assets/3.17.png)
-  2. 设置socket等待队列
-  3. 插入红黑树
+  2. 设置socket等待队列：建立一个表项设置回调函数ep_poll_callback,这里是为了唤醒等待epoll的进程，所以private设置为**NULL**
+  3. 将epitem插入红黑树
 
 ### epoll_wait之等待接收
- 
+- epoll_wait做的事情并不复杂，当被调用时观察eventpoll->rdllist链表里有没有数据。有数据就返回，没有数据就创建一个等待队列项，将其（当前进程）添加到eventpoll的等待队列上，然后将自己阻塞掉
+![img](assets.assets/3.20.png)
+```cpp
+//file: fs/eventpoll.c
+SYSCALL_DEFINE4(epoll_wait, int, epfd, struct epoll_event __user *, events,
+        int, maxevents, int, timeout)
+{
+    ...
+    error = ep_poll(ep, events, maxevents, timeout);
+}
+
+static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
+             int maxevents, long timeout)
+{
+    wait_queue_t wait;
+    ......
+
+fetch_events:
+    //4.1 判断就绪队列上有没有事件就绪
+    if (!ep_events_available(ep)) {
+
+        //4.2 定义等待事件并关联当前进程
+        init_waitqueue_entry(&wait, current);
+
+        //4.3 把新 waitqueue 添加到 epoll->wq 链表里
+        __add_wait_queue_exclusive(&ep->wq, &wait);
+    
+        for (;;) {
+            ...
+            //4.4 让出CPU 主动进入睡眠状态
+            if (!schedule_hrtimeout_range(to, slack, HRTIMER_MODE_ABS))
+                timed_out = 1;
+            ... 
+}
+```
+1. 判断就绪队列上有没有事件就绪：通过调用ep_events_available
+2. 定义等待事件并关联当前进程
+   - 若没有就绪的连接，并把当前进程挂到wq上
+3. 添加到等待队列
+4. 让出CPU主动进入睡眠状态
+
+### 数据来了
+- 在epoll_ctl执行的时候，内核为每一个socket都添加了一个等待队列项（阻塞在当前socket上的进程）；在epoll_wait运行完的时候，又在event_poll对象上添加了等待队列元素（rdlist没有事件）
+![img](assets.assets/3.21.png)
+
+1. 将数据接收到任务队列
+   1. 软中断处理网络帧
+   2. TCP协议栈处理，将接收的数据放入socket的接收队列上
+![img](assets.assets/3.22.png)
+```cpp
+//file: net/ipv4/tcp_input.c
+static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb, int hdrlen,
+            bool *fragstolen)
+{
+    //把接收到的数据放到 socket 的接收队列的尾部
+    if (!eaten) {
+        __skb_queue_tail(&sk->sk_receive_queue, skb);
+        skb_set_owner_r(skb, sk);
+    }
+    return eaten;
+}
+```
+2. 查找就绪回调函数
+   1. 调用完tcp_queue_rcv完成接收之后，接着在调用sk_data_ready来唤醒在socket上等待的用户进程
+   2. 当socket上的数据就绪时，内核找到epoll_ctl添加socket时在其上设置的回调函数ep_poll_callback(3.4.2)
+   ![img](assets.assets/3.23.png)
+    ```
+    //file: net/core/sock.c
+    static void sock_def_readable(struct sock *sk, int len)
+    {
+        struct socket_wq *wq;
+
+        rcu_read_lock();
+        wq = rcu_dereference(sk->sk_wq);
+
+        //这个名字起的不好，并不是有阻塞的进程，
+        //而是判断等待队列不为空
+        if (wq_has_sleeper(wq))
+            //执行等待队列项上的回调函数
+            wake_up_interruptible_sync_poll(&wq->wait, POLLIN | POLLPRI |
+                            POLLRDNORM | POLLRDBAND);
+        sk_wake_async(sk, SOCK_WAKE_WAITD, POLL_IN);
+        rcu_read_unlock();
+    }
+    ```
+   3. 执行socket就绪回调函数：软中断会调用ep_poll_callback
+   ```cpp
+    //file: fs/eventpoll.c
+    static int ep_poll_callback(wait_queue_t *wait, unsigned mode, int sync, void *key)
+    {
+        //获取 wait 对应的 epitem
+        struct epitem *epi = ep_item_from_wait(wait);
+
+        //获取 epitem 对应的 eventpoll 结构体
+        struct eventpoll *ep = epi->ep;
+
+        //1. 将当前epitem 添加到 eventpoll 的就绪队列中
+        list_add_tail(&epi->rdllink, &ep->rdllist);
+
+        //2. 查看 eventpoll 的等待队列上是否有在等待,有就唤醒
+        if (waitqueue_active(&ep->wq))
+            wake_up_locked(&ep->wq);
+   ``` 
+   4. 执行epoll就绪通知：在default_wake_function中找到等待队列(在epoll对象上等待而阻塞掉的进程)里的进程描述符，然后唤醒
+   ![img](assets.assets/3.25.png)
+   5. 将epoll_wait进程推入可运行队列，当这个进程重新运行后，从epoll_wait阻塞时暂停的代码处继续进行，将rdlist中就绪的事件返回给用户
+   ```cpp
+    //file: fs/eventpoll.c
+    static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
+                int maxevents, long timeout)
+    {
+        ......
+        //从等待队列移除
+        __remove_wait_queue(&ep->wq, &wait);
+
+        //设置进程状态
+        set_current_state(TASK_RUNNING);
+        }
+    check_events:
+        //返回就绪事件给用户进程
+        ep_send_events(ep, events, maxevents))
+    }
+   ```
+
+### 小结
+![img](assets.assets/3.26.png)
+- 其中软中断回调函数关系：
+sock_def_readable(sock对象初始化时设置的，用于有数据到达时唤醒进程)
+    => ep_poll_callback(调用epoll_ctl时添加到socket等待队列上的)
+        => default_wake_function(调用epoll_wait时设置到epoll上的) 
+
+- 同步阻塞模型和epoll异同：
+  1. 同步阻塞和epoll在socket等待队列中注册的回调函数不一样，同步阻塞模型是为了回调而唤醒当前等待此socket的进程（.prvate为当前进程），epoll是为了调用ep_poll_callback回调函数（.private为NULL）跳转到挂在epoll上的等待队列做之后的处理，之后继续调用回调函数 default_wake_function
+## 服务器编程模型
+
+### Reactor 模型
+- 该模型主要处理三种事件：连接事件、（读时间）、写事件；
+- 三种关键角色：reactor、acceptor、handler
+
+#### Reactor线程模型
+- 单Reactor单线程：三种事件以及后续的处理都是由一个线程完成
+  1. reactor负责监听客户端事件与事件分发
+  2. 一旦有连接事件，就会分发给acceptor
+  3. 如果是读写事件，就会给handler处理（handler负责处理客户端请求，进行业务处理以及最终返回结果）
+![img](assets.assets/o31.jpg)
+
+- 单Reactor多线程：acceptor、handler的功能由线程执行，外加一个线程池
+  - 在单Reactor多线程中，handler只负责处理读取请求和写回结果，具体的业务逻辑由worker线程执行
+![img](assets.assets/o32.jpg)
+
+- 主从Reactor多线程：一个主Reactor线程，多个子Reactor线程，线程池
+  1. 主Reactor监听事件，在同一个Reactor线程中由acceptor处理连接事件
+  2. 连接建立后，主Reactor会将连接分发给子Reactor线程，让子Reactor处理后续事件，具体业务逻辑依然是worker线程处理
+  3. **由从Reactor返回结果**
+![img](assets.assets/o33.jpg)
+## 本章总结
+- 同步阻塞开销（两次进程上下文切换开销）：
+  1. 进程通过recv系统调用接收一个socket上的数据时，如果没有数据到达，进程就被从CPU上拿下来，切换到另一个进程，导致一次上下文切换
+  2. 当连接上数据就绪的时候，睡眠的进程又会被唤醒，导致一次进程切换开销
+  3. 一个进程只能等待一条连接，如果又很多并发，则需要很多进程
+
+- 多路复用epoll为什么能提高网络性能：
+  - 根本原因是减少了无用的进程上下文切换（高并发场景，一直会有事件到达）
+
