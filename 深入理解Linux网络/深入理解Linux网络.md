@@ -599,7 +599,43 @@ int tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
 ```
 ![img](assets.assets/3.10.png)
 
-- 调用tcp_queue_rcv接收完成后，接着调用sk_data_ready来唤醒socket上等待的用户进程，这是一个函数指针，唤醒等待的进程
+- 调用tcp_queue_rcv接收完成后，接着调用sk_data_ready（初始化时设置成了sock_def_ready）来唤醒socket上等待的用户进程，这是一个函数指针，唤醒等待的进程
+```
+//file: net/core/sock.c
+static void sock_def_readable(struct sock *sk, int len)
+{
+    struct socket_wq *wq;
+
+    rcu_read_lock();
+    wq = rcu_dereference(sk->sk_wq);
+
+    //有进程在此 socket 的等待队列
+    if (wq_has_sleeper(wq))
+    //唤醒等待队列上的进程
+    wake_up_interruptible_sync_poll(&wq->wait, POLLIN | POLLPRI |
+        POLLRDNORM | POLLRDBAND);
+    sk_wake_async(sk, SOCK_WAKE_WAITD, POLL_IN);
+    rcu_read_unlock();
+}
+```
+- 最终函数跳转到__wake_up_common实现唤醒，为了不惊群，这里的nx_exclusive传入的是1
+```cpp
+//file: kernel/sched/core.c
+static void __wake_up_common(wait_queue_head_t *q, unsigned int mode,
+   int nr_exclusive, int wake_flags, void *key)
+{
+    wait_queue_t *curr, *next;
+
+    list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
+    unsigned flags = curr->flags;
+
+    //调用进程curr的回调函数唤醒进程，nr_exclusive为0时，break
+    if (curr->func(curr, mode, wake_flags, key) &&
+        (flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
+    break;
+ }
+}
+```
 
 ### 同步阻塞总结
 - 第一部分是我们自己代码所在的进程
@@ -707,7 +743,7 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 }
 ```
 - 对于ep_insert函数，所有注册都是这个函数中完成的
-```
+```cpp
 //file: fs/eventpoll.c
 static int ep_insert(struct eventpoll *ep, 
                 struct epoll_event *event,
@@ -830,7 +866,7 @@ static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb, int 
    1. 调用完tcp_queue_rcv完成接收之后，接着在调用sk_data_ready来唤醒在socket上等待的用户进程
    2. 当socket上的数据就绪时，内核找到epoll_ctl添加socket时在其上设置的回调函数ep_poll_callback(3.4.2)
    ![img](assets.assets/3.23.png)
-    ```
+    ```cpp
     //file: net/core/sock.c
     static void sock_def_readable(struct sock *sk, int len)
     {
@@ -842,7 +878,6 @@ static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb, int 
         //这个名字起的不好，并不是有阻塞的进程，
         //而是判断等待队列不为空
         if (wq_has_sleeper(wq))
-            //执行等待队列项上的回调函数
             wake_up_interruptible_sync_poll(&wq->wait, POLLIN | POLLPRI |
                             POLLRDNORM | POLLRDBAND);
         sk_wake_async(sk, SOCK_WAKE_WAITD, POLL_IN);
@@ -865,7 +900,24 @@ static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb, int 
 
         //2. 查看 eventpoll 的等待队列上是否有在等待,有就唤醒
         if (waitqueue_active(&ep->wq))
+            //最终调用的是__wake_up_common
             wake_up_locked(&ep->wq);
+        ......
+    }
+
+    static void __wake_up_common(wait_queue_head_t *q, unsigned int mode,
+            int nr_exclusive, int wake_flags, void *key)
+    {
+        wait_queue_t *curr, *next;
+
+        list_for_each_entry_safe(curr, next, &q->task_list, task_list) {
+            unsigned flags = curr->flags;
+
+            if (curr->func(curr, mode, wake_flags, key) &&
+                    (flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
+                break;
+        }
+    }
    ``` 
    4. 执行epoll就绪通知：在default_wake_function中找到等待队列(在epoll对象上等待而阻塞掉的进程)里的进程描述符，然后唤醒
    ![img](assets.assets/3.25.png)
@@ -897,6 +949,36 @@ sock_def_readable(sock对象初始化时设置的，用于有数据到达时唤�
 
 - 同步阻塞模型和epoll异同：
   1. 同步阻塞和epoll在socket等待队列中注册的回调函数不一样，同步阻塞模型是为了回调而唤醒当前等待此socket的进程（.prvate为当前进程），epoll是为了调用ep_poll_callback回调函数（.private为NULL）跳转到挂在epoll上的等待队列做之后的处理，之后继续调用回调函数 default_wake_function
+
+## epoll惊群问题
+- 情况1：只适用于多个线程/进程拥有各自的epfd,然后监听同一listen_fd
+  - Linux4.5以后得到部分解决：
+    - 通过设置WQ_FLAG_EXCLUSIVE关键字，具体见__wake_up_common函数（在epoll_ctl函数中使用EPOLLEXCLUSIVE设置）。
+    - 依然可能惊群，如唤醒的进程忙（没有处于等待队列），没有及时去解决这个请求，就会唤醒其他进程
+
+- 情况2：多个进程监听同一个epfd，在LT模式下，会遍历rdlist表，知道唤醒所有epoll等待队列中的进程，其实不算是惊群问题（加锁可以解决）
+```
+ep_scan_ready_list()
+{
+    // 遍历“就绪链表”
+    ready_list_for_each() {
+        list_del_init(&epi->rdllink);
+        revents = ep_item_poll(epi, &pt);
+        // 保证1:有事件到达
+        if (revents) {
+            __put_user(revents, &uevent->events);
+            if (!(epi->event.events & EPOLLET)) {
+                list_add_tail(&epi->rdllink, &ep->rdllist);
+            }
+        }
+    }
+    // 保证2：rdlist不为空
+    if (!list_empty(&ep->rdllist)) {
+        if (waitqueue_active(&ep->wq))
+            wake_up_locked(&ep->wq);
+    }
+}
+```
 ## 服务器编程模型
 
 ### Reactor 模型
@@ -919,6 +1001,7 @@ sock_def_readable(sock对象初始化时设置的，用于有数据到达时唤�
   2. 连接建立后，主Reactor会将连接分发给子Reactor线程，让子Reactor处理后续事件，具体业务逻辑依然是worker线程处理
   3. **由从Reactor返回结果**
 ![img](assets.assets/o33.jpg)
+
 ## 本章总结
 - 同步阻塞开销（两次进程上下文切换开销）：
   1. 进程通过recv系统调用接收一个socket上的数据时，如果没有数据到达，进程就被从CPU上拿下来，切换到另一个进程，导致一次上下文切换
@@ -927,4 +1010,175 @@ sock_def_readable(sock对象初始化时设置的，用于有数据到达时唤�
 
 - 多路复用epoll为什么能提高网络性能：
   - 根本原因是减少了无用的进程上下文切换（高并发场景，一直会有事件到达）
+
+# 内核时如何发送网络包的
+## 网卡启动准备
+- 调用__igb_open函数，RingBuffer在这里分配
+```
+//file: drivers/net/ethernet/intel/igb/igb_main.c
+static int __igb_open(struct net_device *netdev, bool resuming)
+{
+    struct igb_adapter *adapter = netdev_priv(netdev);
+
+    //分配传输描述符数组
+    err = igb_setup_all_tx_resources(adapter);
+
+    //分配接收描述符数组
+    err = igb_setup_all_rx_resources(adapter);
+
+    //开启全部Ringbuffer
+    netif_tx_start_all_queues(netdev);
+}
+```
+
+## 数据从用户进程到网卡的详细过程
+### send系统调用实现
+主要干了两件事：
+1. 在内核中找出socket，记录着各种协议栈的函数地址
+2. 构造struct msghdr对象，把用户传入的数据，如buffer地址、数据长度等，装进去
+
+![img](assets.assets/4.6.png)
+
+### 传输层处理
+
+#### 传输层拷贝
+1. 进入协议栈inet_sendmsg后，会通过socket找到具体协议的发送函数，对于TCP协议来说，就是tcp_sendmsg
+```
+//file: net/ipv4/tcp.c
+int tcp_sendmsg(...)
+{
+    while(...){
+        while(...){
+            //获取发送队列
+            skb = tcp_write_queue_tail(sk);
+
+            //申请skb 并拷贝
+            ......
+        }
+    }
+}
+```
+![img](assets.assets/4.7.png)
+2. 在内核态申请内存，并把用户内存里的数据拷贝到内核态内存，涉及一次或者几次内存拷贝的开销
+![img](assets.assets/4.9.png)
+3. 满足条件时发送
+```
+//file: net/ipv4/tcp.c
+int tcp_sendmsg(...)
+{
+    while(...){
+    while(...){
+    //申请内核内存并进行拷贝
+
+    //发送判断(未发送的数据是否已经超过最大窗口一半)
+    if (forced_push(tp)) {
+        tcp_mark_push(tp, skb);
+        __tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_PUSH);
+    } else if (skb == tcp_send_head(sk))
+        tcp_push_one(sk, mss_now);  
+    }
+    continue;
+    }
+    }
+}
+```
+
+#### 传输层发送
+1. 假设内核条件已经满足，最终都会实际调用到tcp_write_xmit；这个函数处理了传输层的拥塞控制、滑动窗口等工作。
+```
+//file: net/ipv4/tcp_output.c
+static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+      int push_one, gfp_t gfp)
+{
+    //循环获取待发送 skb
+    while ((skb = tcp_send_head(sk))) 
+    {
+        //滑动窗口相关
+        cwnd_quota = tcp_cwnd_test(tp, skb);
+        tcp_snd_wnd_test(tp, skb, mss_now);
+        tcp_mss_split_point(...);
+        tso_fragment(sk, skb, ...);
+        ......
+
+        //真正开启发送
+        tcp_transmit_skb(sk, skb, 1, gfp);
+    }
+}
+```
+![img](assets.assets/4.10.png)
+2. 发送主过程
+   1. 克隆新的skb：用于重传，最后到达网卡发送完成时，会被释放
+   2. 封装TCP头
+   3. 发送到网络层
+```
+//file: net/ipv4/tcp_output.c
+static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
+    gfp_t gfp_mask)
+{
+    //1.克隆新 skb 出来
+    if (likely(clone_it)) {
+    skb = skb_clone(skb, gfp_mask);
+    ......
+    }
+
+    //2.封装 TCP 头
+    th = tcp_hdr(skb);
+    th->source  = inet->inet_sport;
+    th->dest  = inet->inet_dport;
+    th->window  = ...;
+    th->urg   = ...;
+    ......
+
+    //3.调用网络层发送接口
+    err = icsk->icsk_af_ops->queue_xmit(skb, &inet->cork.fl);
+}
+```
+
+### 网络层发送处理
+![img](assets.assets/4.12.png)
+1. 网络层入口函数
+   1. 查找并设置路由项
+   2. 设置IP头
+```
+//file: net/ipv4/ip_output.c
+int ip_queue_xmit(struct sk_buff *skb, struct flowi *fl)
+{
+    //检查 socket 中是否有缓存的路由表
+    rt = (struct rtable *)__sk_dst_check(sk, 0);
+    if (rt == NULL) {
+    //没有缓存则展开查找
+    //则查找路由项， 并缓存到 socket 中
+    rt = ip_route_output_ports(...);
+    sk_setup_caps(sk, &rt->dst);
+    }
+
+    //为 skb 设置路由表
+    skb_dst_set_noref(skb, &rt->dst);
+
+    //设置 IP header
+    iph = ip_hdr(skb);
+    iph->protocol = sk->sk_protocol;
+    iph->ttl      = ip_select_ttl(inet, &rt->dst);
+    iph->frag_off = ...;
+
+    //发送
+    ip_local_out(skb);
+}
+```
+2. ip_local_out:主要根据iptables配置的一些规则，进行过滤
+```cpp
+//file: net/ipv4/ip_output.c  
+int ip_local_out(struct sk_buff *skb)
+{
+    //执行 netfilter 过滤
+    err = __ip_local_out(skb);
+
+    //开始发送数据
+    if (likely(err == 1))
+    err = dst_output(skb);
+    ......
+```
+.......
+4. 在ip
+
 
