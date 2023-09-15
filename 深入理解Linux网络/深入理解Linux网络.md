@@ -1179,6 +1179,25 @@ int ip_local_out(struct sk_buff *skb)
     ......
 ```
 .......
-4. 在ip
 
+4. 在ip_finish_output总，如果数据大于MTU，执行分片（可以通过控制数据包尺寸小于MTU来优化网络性能）
 
+5. 最后发给ip_finish_output2，向下传递，进入邻居子系统
+```
+//file: net/ipv4/ip_output.c
+static inline int ip_finish_output2(struct sk_buff *skb)
+{
+    //根据下一跳 IP 地址查找邻居项，找不到就创建一个
+    nexthop = (__force u32) rt_nexthop(rt, ip_hdr(skb)->daddr);  
+    neigh = __ipv4_neigh_lookup_noref(dev, nexthop);
+    if (unlikely(!neigh))
+    neigh = __neigh_create(&arp_tbl, &nexthop, dev, false);
+
+    //继续向下层传递
+    int res = dst_neigh_output(dst, neigh, skb);
+}
+```
+
+### 邻居子系统
+- 邻居子系统式位于网络层和数据链路层中间的一个系统，作用是为网络层提供一个下层的封装
+![img](assets.assets/4.15.png)
