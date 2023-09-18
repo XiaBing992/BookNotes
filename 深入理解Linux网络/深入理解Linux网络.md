@@ -1012,6 +1012,11 @@ ep_scan_ready_list()
   - 根本原因是减少了无用的进程上下文切换（高并发场景，一直会有事件到达）
 
 # 内核时如何发送网络包的
+## 网络包发送过程总览
+![img](assets.assets/4.1.png)
+- 当数据发送完毕后，还没有释放缓存队列
+- 网卡在发送完毕后，会给CPU发送一个硬中断通知CPU
+- 这里硬中断最终触发的是**NET_RX_SOFTIRQ**(NET_RX比NET_TX大的多的一部分原因)
 ## 网卡启动准备
 - 调用__igb_open函数，RingBuffer在这里分配
 ```
@@ -1198,6 +1203,87 @@ static inline int ip_finish_output2(struct sk_buff *skb)
 }
 ```
 
-### 邻居子系统
+### 邻居子系统（？？？）
 - 邻居子系统式位于网络层和数据链路层中间的一个系统，作用是为网络层提供一个下层的封装
+- 提供三层到二层的地址映射
 ![img](assets.assets/4.15.png)
+- 邻居子系统主要查找或者创建邻居项；在创建邻居项的时候，有可能发出实际的arp请求
+- 然后封装MAC头，将发送过程传递给下层的网络设备子系统
+
+![img](assets.assets/4.16.png)
+
+### 网络设备子系统
+- 通过dev_queue_xmit进入网络设备子系统
+```
+//file: net/core/dev.c 
+int dev_queue_xmit(struct sk_buff *skb)
+{
+    //选择其中一个发送队列
+    txq = netdev_pick_tx(dev, skb);
+
+    //获取与此队列关联的排队规则
+    q = rcu_dereference_bh(txq->qdisc);
+
+    //如果有队列，则调用__dev_xmit_skb 继续处理数据
+    if (q->enqueue) {
+    rc = __dev_xmit_skb(skb, q, dev, txq);
+    goto out;
+    }
+
+    //没有队列的是回环设备和隧道设备
+    ......
+}
+```
+
+![img](assets.assets/4.17.png)
+
+- 大部分设备都有队列（回环设备和隧道设备除外），现在进入__dev_xmit_skb
+```
+//file: net/core/dev.c
+static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
+     struct net_device *dev,
+     struct netdev_queue *txq)
+{
+    //1.如果可以绕开排队系统
+    if ((q->flags & TCQ_F_CAN_BYPASS) && !qdisc_qlen(q) &&
+        qdisc_run_begin(q)) {
+    ......
+    }
+
+    //2.正常排队
+    else {
+
+    //入队
+    q->enqueue(skb, q)
+
+    //开始发送
+    __qdisc_run(q);
+    }
+}
+```
+- 对于第二种情况，只有quota用尽和其他进程需要CPU时才触发软中断进行发送
+```cpp
+//file: net/sched/sch_generic.c
+void __qdisc_run(struct Qdisc *q)
+{
+    //控制处理网络包的数量
+    int quota = weight_p;
+
+    //循环从队列取出一个 skb 并发送
+    while (qdisc_restart(q)) 
+    {
+    
+        // 如果发生下面情况之一，则延后处理：
+        // 1. quota 用尽
+        // 2. 其他进程需要 CPU
+        if (--quota <= 0 || need_resched()) 
+        {
+            //将触发一次 NET_TX_SOFTIRQ 类型 softirq
+            __netif_schedule(q);
+            break;
+        }
+    }
+}
+```
+
+### 软中断调度
