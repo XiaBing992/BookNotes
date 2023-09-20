@@ -1287,3 +1287,78 @@ void __qdisc_run(struct Qdisc *q)
 ```
 
 ### 软中断调度
+- 如果发送网络包的时候系统态CPU用尽了，会调用__netif_schedule触发软中断
+![img](assets.assets/4.18.png)
+
+### igb网卡驱动发送
+- 在驱动函数里，会将skb挂到RingBuffer上，驱动调用完毕，数据包将真正从网卡发送出去
+![img](assets.assets/4.19.png)
+- 从dev_hard_start_smit开始
+```
+//file: net/core/dev.c
+int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+   struct netdev_queue *txq)
+{
+    //获取设备的回调函数集合 ops
+    const struct net_device_ops *ops = dev->netdev_ops;
+
+    //获取设备支持的功能列表
+    features = netif_skb_features(skb);
+
+    //调用驱动的 ops 里面的发送回调函数 ndo_start_xmit 将数据包传给网卡设备
+    skb_len = skb->len;
+    rc = ops->ndo_start_xmit(skb, dev);
+}
+```
+- ndo_start_xmit在网卡驱动初始化时被赋值
+- 网卡从发送队列的RingBuffer取下来一个元素，并将skb挂到元素上
+![img](assets.assets/4.20.png)
+- igb_tx_map将skb数据映射到网卡可访问的内存DMA区域
+- 触发真正的发送
+
+## RingBuffer内存回收
+- 数据发送完成后，需要清理内存
+![img](assets.assets/4.21.png)
+- 软中断回调函数igb_poll
+- 释放skb
+- 清楚tx_buffer
+- 清除最后的DMA位置，解除映射
+```
+//file: drivers/net/ethernet/intel/igb/igb_main.c
+static int igb_poll(struct napi_struct *napi, int budget)
+{
+    //performs the transmit completion operations
+    if (q_vector->tx.ring)
+        clean_complete = igb_clean_tx_irq(q_vector);
+    ...
+}
+//file: drivers/net/ethernet/intel/igb/igb_main.c
+static bool igb_clean_tx_irq(struct igb_q_vector *q_vector)
+{
+    //free the skb
+    dev_kfree_skb_any(tx_buffer->skb);
+
+    //clear tx_buffer data
+    tx_buffer->skb = NULL;
+    dma_unmap_len_set(tx_buffer, len, 0);
+
+    // clear last DMA location and unmap remaining buffers */
+    while (tx_desc != eop_desc) {
+    }
+}
+```
+![img](assets.assets/4.22.png)
+
+## 本章总结
+- 发送网络数据时都涉及哪些内存拷贝操作？
+1. 内核申请完skb后，会将用户buffer里的数据拷贝到skb
+2. 传输层进入网络层时，会拷贝新的skb，用于重传（TCP）
+3. 第三次拷贝不是必须的，当IP层发现skb大于MTU时才需要进行，申请额外的skb
+
+所以，“零拷贝”不可能是真正的零拷贝，第二次和第三次拷贝省不了
+
+# 深度理解本机网络IO
+
+
+
+
