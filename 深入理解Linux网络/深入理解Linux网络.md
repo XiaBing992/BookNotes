@@ -1203,16 +1203,35 @@ static inline int ip_finish_output2(struct sk_buff *skb)
 }
 ```
 
-### 邻居子系统（？？？）
-- 邻居子系统式位于网络层和数据链路层中间的一个系统，作用是为网络层提供一个下层的封装
-- 提供三层到二层的地址映射
-![img](assets.assets/4.15.png)
+### 邻居子系统
+- 功能：
+  - 邻居子系统式位于**网络层和数据链路层中间**的一个系统，作用是为网络层提供一个下层的封装
+  - 提供三层到二层的地址映射
+  - arp协议触发
+  ![img](assets.assets/4.15.png)
 - 邻居子系统主要查找或者创建邻居项；在创建邻居项的时候，有可能发出实际的arp请求
 - 然后封装MAC头，将发送过程传递给下层的网络设备子系统
+```cpp
+//file: net/core/neighbour.c
+int neigh_resolve_output(){
 
+    //触发 arp 请求
+    if (!neigh_event_send(neigh, skb)) {
+
+    //neigh->ha 是 MAC 地址
+    dev_hard_header(skb, dev, ntohs(skb->protocol),
+            neigh->ha, NULL, skb->len);
+    //发送
+    dev_queue_xmit(skb);
+    }
+}
+```
 ![img](assets.assets/4.16.png)
 
 ### 网络设备子系统
+- 功能：
+  - 管理数据包的发送和接收
+  - 中断合并：多个数据包合并到一起才触发中断进行发送
 - 通过dev_queue_xmit进入网络设备子系统
 ```
 //file: net/core/dev.c 
@@ -1291,6 +1310,10 @@ void __qdisc_run(struct Qdisc *q)
 ![img](assets.assets/4.18.png)
 
 ### igb网卡驱动发送
+功能：
+  - 将skb挂到RingBuffer上
+  - 构造DMA内存映射
+  - 触发数据真正发送
 - 在驱动函数里，会将skb挂到RingBuffer上，驱动调用完毕，数据包将真正从网卡发送出去
 ![img](assets.assets/4.19.png)
 - 从dev_hard_start_smit开始
@@ -1317,7 +1340,7 @@ int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
 - 触发真正的发送
 
 ## RingBuffer内存回收
-- 数据发送完成后，需要清理内存
+- 数据发送完成后，需要清理内存（网卡设备会触发一个硬中断）
 ![img](assets.assets/4.21.png)
 - 软中断回调函数igb_poll
 - 释放skb
@@ -1355,10 +1378,156 @@ static bool igb_clean_tx_irq(struct igb_q_vector *q_vector)
 2. 传输层进入网络层时，会拷贝新的skb，用于重传（TCP）
 3. 第三次拷贝不是必须的，当IP层发现skb大于MTU时才需要进行，申请额外的skb
 
-所以，“零拷贝”不可能是真正的零拷贝，第二次和第三次拷贝省不了
+所以，“零拷贝” 不可能是真正的零拷贝，第二次和第三次拷贝省不了
 
 # 深度理解本机网络IO
 
+## 跨机网络通信过程
+### 跨机数据发送
+- 数据发送流程
+![img](assets.assets/5.1.png)
+![img](assets.assets/5.2.png)
 
+- 当网络发送完成后，会触发硬中断来触发CPU，用于释放RingBuffer中使用的内存
+![img](assets.assets/5.3.png)
 
+### 跨机数据接收
+- 跨机数据接收过程
+![img](assets.assets/5.4.png)
+![img](assets.assets/5.5.png)
+
+### 跨机网络通信汇总
+![img](assets.assets/5.6.png)
+
+## 本机发送过程
+### 网络层路由
+- 对于本机网络IO来说，特殊之处在于local路由表中就能找到路由项，对应的设备都将使用loopback网卡
+![img](assets.assets/5.7.png)
+- 从ip_queue_xmit开始
+```
+//file: net/ipv4/ip_output.c
+int ip_queue_xmit(struct sk_buff *skb, struct flowi *fl)
+{
+    //检查 socket 中是否有缓存的路由表
+    rt = (struct rtable *)__sk_dst_check(sk, 0);
+    if (rt == NULL) {
+    //没有缓存则展开查找
+    //则查找路由项， 并缓存到 socket 中
+    rt = ip_route_output_ports(...);
+    sk_setup_caps(sk, &rt->dst);
+ }
+```
+- 查找路由表的函数依次调用ip_route_output_flow、__ip_route_output_key、fib_lookup函数
+```cpp
+//file:include/net/ip_fib.h
+static inline int fib_lookup(struct net *net, const struct flowi4 *flp,
+        struct fib_result *res)
+{
+    struct fib_table *table;
+
+    //查找local路由表
+    table = fib_get_table(net, RT_TABLE_LOCAL);
+    if (!fib_table_lookup(table, flp, res, FIB_LOOKUP_NOREF))
+    return 0;
+
+    //查找main路由表
+    table = fib_get_table(net, RT_TABLE_MAIN);
+    if (!fib_table_lookup(table, flp, res, FIB_LOOKUP_NOREF))
+    return 0;
+    return -ENETUNREACH;
+}
+```
+- 在local找到后，返回__ip_route_output_key函数
+```
+//file: net/ipv4/route.c
+struct rtable *__ip_route_output_key(struct net *net, struct flowi4 *fl4)
+{
+    if (fib_lookup(net, fl4, &res)) {
+    }
+    if (res.type == RTN_LOCAL) {
+    dev_out = net->loopback_dev;
+    ...
+    }
+
+    rth = __mkroute_output(&res, fl4, orig_oif, dev_out, flags);
+    return rth;
+}
+```
+- 对于本机网络请求，设备全部使用net->loopback_dev，即虚拟网卡
+- 接下来的调用和跨机网络一样，进入ip_finish_output，进入邻居子系统
+- io虚拟网卡的MTU比Ethernet大很多，物理网卡一般为1500，io虚拟接口又65535
+### 本机IP路由
+- 本机IP和用127.0.0.1在性能上有差异吗？
+都会查询到本机路由表，而且local路由表中所有的路由项都设置成了PIN_LOCAL，所以设置了这个的都会在__ip_route_output_key中走io虚拟网卡
+
+### 网络设备子系统
+- 跨机发送过程
+![img](assets.assets/5.8.png)
+
+- 对于启动回环设备来说，没有队列的问题（q->enqueue），直接进入dev_hard_start_smit
+- 接着进入回环设备的“驱动”力发送回调函数loopback_xmit，将skb发送出去
+![img](assets.assets/5.9.png)
+```
+//file: net/core/dev.c
+int dev_queue_xmit(struct sk_buff *skb)
+{
+    q = rcu_dereference_bh(txq->qdisc);
+    if (q->enqueue) {//回环设备这里为 false
+    rc = __dev_xmit_skb(skb, q, dev, txq);
+    goto out;
+    }
+
+    //开始回环设备处理
+    if (dev->flags & IFF_UP) {
+    dev_hard_start_xmit(skb, dev, txq, ...);
+    ...
+    }
+}
+
+```
+### “驱动”程序
+- 回环设备的“驱动”程序的工作流程
+![img](assets.assets/5.10.png)
+- input_pkt_queue通常用于本机通信中，用于放置数据包
+- 调用**NAPI**的相关函数触发完软中断，发送过程算完成了
+```cpp
+//file:net/core/dev.c
+static inline void ____napi_schedule(struct softnet_data *sd,
+         struct napi_struct *napi)
+{
+    list_add_tail(&napi->poll_list, &sd->poll_list);
+    __raise_softirq_irqoff(NET_RX_SOFTIRQ);
+}
+```
+
+## 本机接收过程
+- 在跨机的网络包接收过程中，需要经过硬中断才能触发软中断，在本机的网络IO过程中，不需要经过真正的网卡，所以网卡的发送过程、硬中断就省去了
+![img](assets.assets/5.11.png)
+- loopback网卡的poll函数在初始化的时候设置成了process_backlog函数
+- 函数将sd->input_pkt_queue里的skb链到sd->process_queue链表上去
+- 然后再从sd->process_queue上取下包进行处理
+```
+static int process_backlog(struct napi_struct *napi, int quota)
+{
+    while(){
+    while ((skb = __skb_dequeue(&sd->process_queue))) {
+    __netif_receive_skb(skb);
+    }
+
+    //skb_queue_splice_tail_init()函数用于将链表a连接到链表b上，
+    //形成一个新的链表b，并将原来a的头变成空链表。
+    qlen = skb_queue_len(&sd->input_pkt_queue);
+    if (qlen)
+    skb_queue_splice_tail_init(&sd->input_pkt_queue,
+            &sd->process_queue);
+    
+    }
+}
+```
+![img](assets.assets/5.12.png)
+
+## 本章总结
+![img](assets.assets/5.13.png)
+- 本机网络IO不需要进RingBuffer，直接把skb传给协议栈，但是再内核的其他组件上，一点也没少
+- 访问本机服务时，所有本机IP都初始化到local路由表里，类型写死了PIN_LOCAL，所以都会选择IO虚拟设备。所以使用127.0.0.1和使用本机IP没有区别
 
