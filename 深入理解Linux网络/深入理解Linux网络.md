@@ -1716,7 +1716,6 @@ int __inet_hash_connect(...)
 - 接下来进入for循环，其中offset是计算出来的随机数，故循环的作用就是把某个端口范围的可用端口都遍历一遍，直到找到可用的端口后停止
   - 首先判断是否是保留端口
   - 检查是否端口已经使用
-  - 
 ```cpp
 //file:net/ipv4/inet_hashtables.c
 int __inet_hash_connect(...)
@@ -1857,8 +1856,474 @@ int tcp_connect(struct sock *sk)
 - 如果connect之前使用了bind，会使用bind时确定的端口
 
 ## 完整TCP连接建立过程
+- 三次握手
+```
+//服务端核心代码
+int main(int argc, char const *argv[])
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    bind(fd, ...);
+    listen(fd, 128);
+    accept(fd, ...);
+    ...
+}
+//客户端核心代码
+int main(){
+    fd = socket(AF_INET,SOCK_STREAM, 0);
+    connect(fd, ...);
+    ...
+}
+
+```
+![img](assets.assets/6.6.png)
+
+### 客户端connect
+- 客户端会进入系统调用tcp_v4_connect
+```
+//file: net/ipv4/tcp_ipv4.c
+int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+{
+    //设置 socket 状态为 TCP_SYN_SENT
+    tcp_set_state(sk, TCP_SYN_SENT);
+
+    //动态选择一个端口
+    err = inet_hash_connect(&tcp_death_row, sk);
+
+    //函数用来根据 sk 中的信息，构建一个完成的 syn 报文，并将它发送出去。
+    err = tcp_connect(sk);
+}
+```
+
+### 服务端响应SYN
+- tcp_v4_do_rcv处理握手过程
+```cpp
+//file: net/ipv4/tcp_ipv4.c
+int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
+{
+    ...
+    //服务器收到第一步握手 SYN 或者第三步 ACK 都会走到这里
+    if (sk->sk_state == TCP_LISTEN) {
+        // 查看半连接队列
+        struct sock *nsk = tcp_v4_hnd_req(sk, skb);
+    }
+
+    //根据不同的socket状态进行不同的处理
+    if (tcp_rcv_state_process(sk, skb, tcp_hdr(skb), skb->len)) {
+        rsk = sk;
+        goto reset;
+    }
+}
+```
+- tcp_v4_hnd_req查看半连接队列
+  - 第一次响应SYN时，半连接队列里什么都没有，直接返回
+```cpp
+//file:net/ipv4/tcp_ipv4.c
+static struct sock *tcp_v4_hnd_req(struct sock *sk, struct sk_buff *skb)
+{
+    // 查找 listen socket 的半连接队列
+    struct request_sock *req = inet_csk_search_req(sk, &prev, th->source,
+            iph->saddr, iph->daddr);
+    ...
+    return sk;
+}
+```
+- 根据不同的socket状态进行不同的处理
+```cpp
+//file:net/ipv4/tcp_input.c
+int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+     const struct tcphdr *th, unsigned int len)
+{
+    switch (sk->sk_state) {
+    //第一次握手
+    case TCP_LISTEN:
+    if (th->syn) { //判断是 SYN 握手包
+        ...
+        if (icsk->icsk_af_ops->conn_request(sk, skb) < 0)
+        return 1;
+    ......
+}  
+```
+- 其中conn_request为函数指针，用于响应SYN的主要处理逻辑
+  - 判断半连接队列是否满了
+  - 如果满了判断是否开启了tcp_syncookies内核参数（用于防止TCP_SYN攻击，在服务器收到TCP_SYN包并返回TCP SYN+ACK包时，不单独分配一个数据区，而是根据SYN计算出一个cookie值，在收到Tcp ACK包时，Tcp服务器在根据那个cookie值检查这个Tcp ACK包的合法性）
+  - 如果满了并且未开启，则该握手包直接放弃
+  - 判断全连接队列是否满了，且young_ack数量大于1的化，那么直接丢弃（young_ack是半连接队列里的计数器，记录的是刚有SYN到达，没有被SYN_ACK重传定时器重传过的SYN_ACK，同时也没有完成过三次握手的sock数量）
+```cpp
+//file: net/ipv4/tcp_ipv4.c
+int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+{
+    //看看半连接队列是否满了
+    if (inet_csk_reqsk_queue_is_full(sk) && !isn) {
+        want_cookie = tcp_syn_flood_action(sk, skb, "TCP");
+    if (!want_cookie)
+        goto drop;
+    }
+
+    //在全连接队列满的情况下，如果有 young_ack，那么直接丢
+    if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1) {
+        NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
+        goto drop;
+    }
+    ...
+    //分配 request_sock 内核对象
+    req = inet_reqsk_alloc(&tcp_request_sock_ops);
+
+    //构造 syn+ack 包
+    skb_synack = tcp_make_synack(sk, dst, req,
+    fastopen_cookie_present(&valid_foc) ? &valid_foc : NULL);
+
+    if (likely(!do_fastopen)) {
+    //发送 syn + ack 响应
+    err = ip_build_and_send_pkt(skb_synack, sk, ireq->loc_addr,
+        ireq->rmt_addr, ireq->opt);
+
+    //添加到半连接队列，并开启计时器
+    inet_csk_reqsk_queue_hash_add(sk, req, TCP_TIMEOUT_INIT);
+    }else ...
+}
+```
+- 最后把握手信息添加到半连接队列，并开启计时器
+- 如果在某个时间内没有收到客户端的第三次握手，服务端就会重传synack包
+
+### 客户端响应SYNACK
+- 客户端收到服务端发来的synack包的时候，也会进入tcp_rcv_state_process函数
+```cpp
+//file:net/ipv4/tcp_input.c
+//除了 ESTABLISHED 和 TIME_WAIT，其他状态下的 TCP 处理都走这里
+int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+     const struct tcphdr *th, unsigned int len)
+{
+    switch (sk->sk_state) {
+        //服务器收到第一个ACK包
+        case TCP_LISTEN:
+        ...
+        //客户端第二次握手处理 
+        case TCP_SYN_SENT:
+        //处理 synack 包
+        queued = tcp_rcv_synsent_state_process(sk, skb, th, len);
+        ...
+    return 0;
+}
+```
+- synack包主要处理逻辑
+```cpp
+//file:net/ipv4/tcp_input.c
+static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
+      const struct tcphdr *th, unsigned int len)
+{
+    ...
+    tcp_ack(sk, skb, FLAG_SLOWPATH);
+
+    //连接建立完成 
+    tcp_finish_connect(sk, skb);
+
+    if (sk->sk_write_pending ||
+        icsk->icsk_accept_queue.rskq_defer_accept ||
+        icsk->icsk_ack.pingpong)
+    //延迟确认...
+    else {
+        tcp_send_ack(sk);
+    }
+} 
+
+//file: net/ipv4/tcp_input.c
+static int tcp_clean_rtx_queue(struct sock *sk, int prior_fackets,
+       u32 prior_snd_una)
+{
+    //删除发送队列
+    ...
+
+    //删除定时器
+    tcp_rearm_rto(sk);
+}
+
+//file: net/ipv4/tcp_input.c
+void tcp_finish_connect(struct sock *sk, struct sk_buff *skb)
+{
+    //修改 socket 状态
+    tcp_set_state(sk, TCP_ESTABLISHED);
+
+    //初始化拥塞控制
+    tcp_init_congestion_control(sk);
+    ...
+
+    //保活计时器打开
+    if (sock_flag(sk, SOCK_KEEPOPEN))
+    inet_csk_reset_keepalive_timer(sk, keepalive_time_when(tp));
+}
+//file:net/ipv4/tcp_output.c
+void tcp_send_ack(struct sock *sk)
+{
+    //申请和构造 ack 包
+    buff = alloc_skb(MAX_TCP_HEADER, sk_gfp_atomic(sk, GFP_ATOMIC));
+    ...
+
+    //发送出去
+    tcp_transmit_skb(sk, buff, 0, sk_gfp_atomic(sk, GFP_ATOMIC));
+}
+```
+- 客户端响应来自服务端的synack时清除了connect时设置的重传定时器，把当前socket状态设置为ESTABLISHED，开启保活计时器（用于探测当前连接是否有效，长时间没收到数据，就发送探测报文）后发出第三次握手ack确认
+
+### 服务端响应ACK
+- 服务端响应第三次握手的ack时同样会进入tcp_v4_do_rcv
+```
+//file: net/ipv4/tcp_ipv4.c
+int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
+{
+    ...
+    if (sk->sk_state == TCP_LISTEN) {
+    struct sock *nsk = tcp_v4_hnd_req(sk, skb);
+    }
+
+    if (tcp_rcv_state_process(sk, skb, tcp_hdr(skb), skb->len)) {
+        rsk = sk;
+        goto reset;
+    }
+}
+```
+- 创建子socket
+- 删除半连接队列：把连接请求从半连接队列删除
+- 添加全连接队列：添加新创建的sock对象
+- 设置连接为ESTABLISHED
+- 服务端响应第三次握手ACK所做的工作是把当前半连接对象删除，创建了新的sock后加入全连接队列，最后将新连接状态设置为ESTABLISHED
+
+### 服务端accept
+- 就是从全连接队列的链表里获取一个头元素返回
+```
+//file: net/ipv4/inet_connection_sock.c
+struct sock *inet_csk_accept(struct sock *sk, int flags, int *err)
+{
+    //从全连接队列中获取
+    struct request_sock_queue *queue = &icsk->icsk_accept_queue;
+    req = reqsk_queue_remove(queue);
+
+    newsk = req->sk;
+    return newsk;
+}
+```
+
+### 连接建立过程总结
+![img](assets.assets/6.7.png)
+- 一条TCP连接消耗多少时间
+  1. 内核消耗CPU进行接收、发送或者处理
+  2. 网络传输
+- 网络传输比双端CPU耗时高1000倍左右，所以一般只考虑网络延时
+
+### 异常TCP连接建立情况
+- connect系统调用耗时失控
+  - 端口不充足，循环执行很多遍
+  - 每次循环内部需要等待锁以及在哈希表中执行多次的搜索
+  - 这里的锁是自旋锁
+```cpp
+//file:net/ipv4/inet_hashtables.c
+int __inet_hash_connect(...)
+{
+    inet_get_local_port_range(&low, &high);
+    remaining = (high - low) + 1;
+
+    for (i = 1; i <= remaining; i++) {
+    // 其中 offset 是一个随机数
+    port = low + (i + offset) % remaining;
+    head = &hinfo->bhash[inet_bhashfn(net, port,
+        hinfo->bhash_size)];
+
+    //加锁
+    spin_lock(&head->lock); 
 
 
+    //一大段的选择端口逻辑
+    //......
+    //选择成功就 goto ok
+    //不成功就 goto next_port
+
+    next_port:
+    //解锁
+    spin_unlock(&head->lock); 
+    }
+}
+```
+- 正常和异常情况
+![img](assets.assets/6.8.png)
+![img](assets.assets/6.9.png)
+- 解决办法：
+  1. 修改内核参数多预留端口号
+  2. 改用长连接
+  3. 尽快回收TIME_WAIT
+
+### 第一次握手丢包
+- 半连接队列满
+  - 通过设置tcp_syncookies解决
+- 全连接队列满
+  - 在全连接队列满，且同时有young_ack的情况下，那么内核同样会丢掉该SYN握手包
+```
+//file: net/ipv4/tcp_ipv4.c
+int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+{
+    //看看半连接队列是否满了
+    ...
+
+    //看看全连接队列是否满了
+    if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) > 1) {
+    NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENOVERFLOWS);
+    goto drop;
+    }
+    ...
+    drop:
+    NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_LISTENDROPS);
+    return 0; 
+}
+```
+- 客户端发起重试：客户端如果长时间没有收到synack，就会超时重传，但重传计时器是以秒来计算的，所以对接口耗时影响非常大
+![img](assets.assets/6.10.png)
+```
+//file:net/ipv4/tcp_output.c
+int tcp_connect(struct sock *sk)
+{
+    ...
+    //实际发出 syn
+    err = tp->fastopen_req ? tcp_send_syn_data(sk, buff) :
+        tcp_transmit_skb(sk, buff, 1, sk->sk_allocation);
+
+    //启动重传定时器
+    inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+        inet_csk(sk)->icsk_rto, TCP_RTO_MAX);
+}
+```
+
+### 第三次握手丢包
+- 服务器全队列满了，来自客户端的ack握手包将被丢弃
+  - 不过第三次握手失败并不是客户端重试，而是由服务端来重发synack
+
+### 握手异常总结
+- 如果端口不充足，会导致CPU开销上升
+  - 通过调整ip_local_port_range来尽量加大端口范围
+  - 尽量复用连接
+- 服务端在第一次握手时丢包
+  - 半连接队列满，且tcp_syncookies为0
+  - 全连接队列满，且由未完成的半连接请求
+- 服务端在第三次握手时
+- 解决办法:
+  1. 打开syncookie
+  2. 加大连接队列长度
+  3. 尽快调用accept
+  4. 尽早拒绝：直接报错，不要让客户端超时等待
+  5. 尽量减少TCP连接的次数：用长连接代替短连接
+
+## 如何查看是否有连接队列溢出发生
+
+### 全连接队列溢出判断
+#### 全连接溢出丢包
+- 全连接队列溢出都会记录到ListenOverflows这个MIB，对应SNMP统计信息的ListenDrops这一项
+#### netstat工具源码
+- 在执行netstat -s的时候，会读取SNMP统计信息
+
+#### 半连接队列溢出判断
+- 对应ListenDrops统计项
+
+### 小结
+- 对于全连接队列，使用netstat -s可以判断是否有丢包发生
+- 对于半连接队列，只要保证tcp_syncookies这个内核参数是1就能保证不会有因为半连接队列满而丢包
+
+## 本章总结
+- listen作用
+  1. 创建了半连接、全连接队列
+- Cannot assign requested address报错？
+  - 没找到可用端口
+- 一个客户端端口可以同时用在两条连接上吗？
+  - 查看四元组是否完全一致
+- 服务端半/全连接队列满了会怎么样？
+- 新连接的socket内核对象是什么时候建立的？
+  - 实际为struct sock，在第三次握手完毕时创建的
+  - 在用户进程调用accept的时候，直接把该对象取出来，在包装成一个sock返回
+- 建立一条TCP连接需要消耗多长时间？
+  - 约等于一个RTT，但是如果出现了丢包，无论哪种原因，最少都要s级了
+- 把服务器部署在北京，给纽约的用户访问可行吗
+  - 计算下来延迟一般都要200ms
+
+# 一条TCP连接消耗多大的内存
+## Linux内核如何管理内存
+- 内核使用了一种叫SLAB/SLUB的内存管理机制，这种管理机制通过四个步骤把物理内存条管理起来，供内核申请和分配内核对象
+![img](assets.assets/7.1.png)
+### node划分
+- 现代的服务器上，内存和CPU都是所谓的NUMA架构
+- 每一个CPU以及和它直连的内存条组成了node
+![img](assets.assets/7.2.png)
+
+### zone划分
+- 每个node又会划分成若干的zone
+  - ZONE_DMA：地址最低的一块内存区域，供IO设备DMA访问
+  - ZONE_DMA32：该zone用于支持32位地址总线的DMA设备，只在64位系统里有效
+  - ZONE_NORMAL：在x86-64架构下，上面两种之外的内存全在NORMAL的zone里管理
+![img](assets.assets/7.4.png)
+
+### 基于伙伴系统管理空闲页面
+- 伙伴系统
+![img](assets.assets/7.6.png)
+- 申请8kb例子
+![img](assets.assets/7.8.png)
+
+### slab分配器
+- 在伙伴系统之上，**内核**又一个专用的内存分配器，叫slab或slub
+- 这种分配器最大的特点是只分配特定大小、甚至是特定的对象。这样当一个对象释放后，另一个同类的对象可以直接使用这块内存，极大的降低了碎片发生的概率
+![img](assets.assets/7.9.png)
+- slab相关的内核对象定义：
+```
+//file: include/linux/slab_def.h
+struct kmem_cache {
+    struct kmem_cache_node **node
+    ......
+}
+
+//file: mm/slab.h
+struct kmem_cache_node {
+    struct list_head slabs_partial; 
+    struct list_head slabs_full;
+    struct list_head slabs_free;
+    ......
+}
+```
+- 每个slab_cache都有满、半满、空三个链表，每个链表节点都对应一个slab，一个slab又一个或者多个内存页组成，每一个slab内都保存的是同等大小的对象
+![img](assets.assets/7.10.png)
+- 当cache中内存不够时，会调用基于伙伴系统的分配器请求整页连续内存的分配
+- 内核中会有很多个kmen_cache存在，他们都是在Linux初始化或者是运行的过程中分配出来的，有的是专用的，用的是通用的
+
+### 小结
+- 内核怎么使用内存
+  - 前三步是基础模块，为应用程序分配内存时也能用到
+  - 第四步仅用于内存
+![img](assets.assets/7.12.png)
+
+## TCP连接相关内核对象
+- socket的创建方式有两种，一种是直接调用socket函数，另外一种是调用accept接收
+
+### socket函数直接创建
+- socket函数会进入__sock_create内核函数
+```
+int __sock_create(...)
+{
+    //申请struct socket内核对象
+    sock = sock_alloc();
+    //调用协议族的创建函数sock
+    err = pf -> create(net, sock, protocol, kern);
+    ......
+}
+```
+#### sock_inode_cache申请
+- 在sock_alloc函数中，申请了一个struct socket_alloc内核对象，将socket和inode信息关联了起来
+
+#### TCP对象申请
+#### file对象申请
+- 在Linxu中，一切皆文件，真是通过和struct file对象关联起来让socket看起来也是一个文件
+
+### 服务端socket创建
+
+## 实测TCP内核对象开销
+1. 一条ESTABLISH状态的空连接消耗的内存大约是3KB多一点
+2. 对于非ESTABLISH状态下的连接，内核会回收不需要的内核对象
+3. 一条TIME_WAIT状态的连接需要的内存也就是0.4KB左右
+
+# 一条机器最多能支持多少条TCP连接
+## 相关实际问题
 
 
 
