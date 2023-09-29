@@ -2323,8 +2323,364 @@ int __sock_create(...)
 3. 一条TIME_WAIT状态的连接需要的内存也就是0.4KB左右
 
 # 一条机器最多能支持多少条TCP连接
-## 相关实际问题
+## 理解Linux最大文件描述符限制
+- 限制打开文件数的内核参数有三个：fs.nr_open、nofile、fs.file-max
+### 找到源码入口
+- socket系统调用
+```
+SYSCALL_DEFINE3(...)
+{
+    retval = sock_map_fd(sock, ......)
+    ......
+}
+```
+- socket调用sock_map_fd来创建相关内核对象
+```
+static int sock_map_fd(struct socket *sock, int flags)
+{
+    struct file *newfile;
 
+    //获取可用fd句柄号
+    //判断打开文件描述符是否超过soft nofile 和 fs.nr_open
+    int fd = get_unused_fd_flags(flags);
+    if (unlikely(fd < 0))
+    {
+        return fd;
+    }
 
+    //创建sock_alloc_file对象
+    //判断打开文件数是否超过fs.file-max
+    newfile = sock_alloc_file(sock, flags, NULL);
+    if (likely(!IS_ERR(newfile)))
+    {
+        fd_install(fd, newfile);
+        return fd;
+    }
+
+    put_unused_fd(fd);
+    return PTR_ERR(newfile);
+}
+```
+- 总结：
+  - get_unused_fd_flags：申请fd，找一个可用的下标
+  - sock_alloc_file：申请真正的file内核对象
+![img](assets.assets/8.1.jpg)
+
+### 寻找进程级限制nofile和fs.nr_open
+- get_unused_fd_flags中判断了nofile和fs.nr_open
+- 进程打开文件数超过这两个，就会报错
+- 内核代码中先判断soft nofile，在判断fs.nr_open
+- fs.nr_open 是系统全局的，soft nofile则可以分用户控制
+
+### 寻找系统级限制fs.file-max
+- 在sock_alloc_file中判断打开文件数是否超过fs.file-max
+```
+struct file *get_empty_filp(void)
+{
+    if (get_nr_files() >= files_stat.max_files &&
+     !capable(CAP_SYS_ADMIN))//这里root用户不受影响
+     {
+
+     }
+}
+```
+- !capable(CAP_SYS_ADMIN)表示不限制非root用户。所以当文件打开过多无法使用ps、kill等命令，可以直接使用root账号
+
+### 小结
+- Linux上能打开多少文件，有两种限制：
+  1. 进程级别的两个参数
+  2. 系统级别的限制，但不限制root用户
+
+## 一台服务端机器可以最多可以支撑多少条TCP连接
+相关：
+1. 四元组：如果目的ip和端口号固定，也可以达到$2^{32}*2^{16}$
+2. 描述符限制：每维持一条TCP连接，就要创建一个文件对象
+3. 内存限制：一条空TCP消耗3.3KB左右（4GB内存可以维持约100万条），但是接收数据的话，又会开缓冲区，增加内存开销
+4. CPU限制：业务逻辑复杂，消耗CPU资源
+
+## 一台客户端机器最多只能65535条连接吗
+- 可以增加IP以增加连接数
+### 端口复用增加连接数
+- 同一个客户端使用同一个端口连接不同的服务器或者连接同一个服务器的不同端口
+
+- 是怎么做到区分数据该发到哪条连接上的？
+  - socket中的主要数据结构：
+  ```cpp
+  // file: include/net/sock.h
+  struct sock_common {
+      union {
+      __addrpair skc_addrpair; //TCP连接IP对
+      struct {
+      __be32 skc_daddr;
+      __be32 skc_rcv_saddr;
+      };
+      }; 
+      union {
+      __portpair skc_portpair; //TCP连接端口对
+      struct {
+      __be16 skc_dport;
+      __u16 skc_num;
+      };
+      };
+      ......
+  }
+
+  ```
+  ![img](assets.assets/8.1.7.png)
+
+  - 在网络包到达网卡后，依次经历DMA、硬中断、软中断等处理，最后被送到socket接收队列中，对于TCP协议来说：
+    ```
+    // file: net/ipv4/tcp_ipv4.c
+    int tcp_v4_rcv(struct sk_buff *skb)
+    {
+        ......
+        th = tcp_hdr(skb); //获取tcp header
+        iph = ip_hdr(skb); //获取ip header
+
+        //寻找连接
+        sk = __inet_lookup_skb(&tcp_hashinfo, skb, th->source, th->dest);
+        ......
+    }
+    // file: include/net/inet_hashtables.h
+    static inline struct sock *__inet_lookup(struct net *net,
+        struct inet_hashinfo *hashinfo,
+        const __be32 saddr, const __be16 sport,
+        const __be32 daddr, const __be16 dport,
+        const int dif)
+    {
+        u16 hnum = ntohs(dport);
+        struct sock *sk = __inet_lookup_established(net, hashinfo,
+            saddr, sport, daddr, hnum, dif);
+
+        return sk ? : __inet_lookup_listener(net, hashinfo, saddr, sport,
+                daddr, hnum, dif);
+    }
+    struct sock *__inet_lookup_established(struct net *net,
+      struct inet_hashinfo *hashinfo,
+      const __be32 saddr, const __be16 sport,
+      const __be32 daddr, const u16 hnum,
+      const int dif)
+    {
+        //将源端口、目的端口拼成一个32位int整数
+        const __portpair ports = INET_COMBINED_PORTS(sport, hnum); 
+        ......
+
+        //内核用hash的方法加速socket的查找
+        unsigned int hash = inet_ehashfn(net, daddr, hnum, saddr, sport); 
+        unsigned int slot = hash & hashinfo->ehash_mask;
+        struct inet_ehash_bucket *head = &hashinfo->ehash[slot];
+
+        begin:
+        //遍历链表，逐个对比直到找到
+        sk_nulls_for_each_rcu(sk, node, &head->chain) {
+        if (sk->sk_hash != hash)
+        continue;
+        if (likely(INET_MATCH(sk, net, acookie,
+                saddr, daddr, ports, dif))) {
+        if (unlikely(!atomic_inc_not_zero(&sk->sk_refcnt)))
+            goto begintw;
+        if (unlikely(!INET_MATCH(sk, net, acookie,
+            saddr, daddr, ports, dif))) {
+            sock_put(sk);
+            goto begin;
+        }
+        goto out;
+        }
+        }
+    }
+
+    ```
+    - 内核使用哈希+链表的方式管理所维护的socket
+    - 将tcp header中的_saddr、daddr、__ports和Linux中的socket进行对比，找到对应fd
+
+- 增加TCP并发能力：
+  1. 为客户端配置多个IP
+  2. 连接不同的服务端，开启端口复用
+
+## 本章总结
+- 支持1亿用户，需要多少台机器？
+如果内存为128G，那么一台服务器可以考虑用来支持500万条并发，消耗20GB左右的内存来保存socket，剩下的用于开缓冲区。所以，一亿用户需要20台机器左右
+
+# 网络优化性能建议
+## 网络请求优化
+
+### 尽量减少不必要的网络IO
+例子：在自己开发的接口里请求几个第三方服务，这些服务提供了一个SDK。为了省事直接在本机上把这些SDK部署上来，通过本机网络IO调用这些SDK。而不使用这种方式可以将CPU整体核数消减20%以上
+
+### 尽量合并网络请求
+- 尽量经过一次网络IO就能得到想要的数据
+
+### 调用者和被调用者机器尽可能部署的近一点
+- 减少网络延迟
+
+### 内网调用不要用外网域名
+1. 外网接口慢
+2. 带宽成本高：内网通信不涉及通信费用’
+3. NAT单点瓶颈：一般一个公司，NAT就可能只有几台，容易成为瓶颈
+
+## 接收过程优化
+### 调整网卡RingBuffer大小
+- 增大RingBuffer，解决丢包问题
+- 但是会增加处理网络包的延时，因为排队的包太多
+
+### 多队列网卡RSS调优
+- 每一个队列有自己的中断号，由于CPU的亲和性，每一个中断号由一个CPU来处理。
+- 在网卡支持多队列的服务器上，想提高内核的收包能力，就可以增大队列数
+
+### 硬中断合并
+
+### 软中断budget调整
+- 设定ksoftirqd一次最多处理多少个包让出CPU，如果想提高内核处理包的效率，可以提高
+```
+net.core.netdev_budget = 300
+```
+
+### 接收处理合并
+- 攒一堆数据包后再通知CPU，不过数据包依然是分开的
+- LRO/GRO 将数据包合并再往上层传输
+- LRO和GRO合并包的位置不同，LRO是再网卡上就把合并做了，必须要网卡硬件支持；GRO是在内核源码中用软件的方式实现的
+
+## 发送过程优化
+- 控制数据包的大小
+  - 分片越多，丢包风险越大
+
+- 减少内存拷贝
+  - 使用mmap和sendfile
+  - mmap：还是会涉及到两次内核态和用户态的上下文切换
+
+- 推迟分片
+  - 使用TSO和GSO
+
+- 多队列网卡XPS调优
+- 使用eBPF绕开协议栈的网络IO
+
+## 内核与进程协作优化
+- 进行少使用recvfrom等进程阻塞的方式
+  - 每个进程只能同时等待一条连接
+  - 进程之间互相切换的时候要消耗很多的CPU周期，一次切换大约是3-5us
+  - 频繁的切换导致L1、L2、L3等高速缓存的效果大大折扣
+
+- 使用成熟的网络库
+- 使用Kernel-ByPass新技术
+  - 可以绕开内核协议栈，在用户态实现网络包的接收
+
+## 握手挥手过程优化
+- 配置充足的端口范围
+- 客户端最好不要用bind
+- 小心连接队列溢出
+- 减少握手重试：超时重传的时间是翻倍增加的
+- 打开TFO：第三次握手ack包可以携带要发送的数据给服务器的数据，可以节约一个RTT的时间开销
+```bash
+# vi /etc/sysctl.conf
+net.ipv4.tcp_fastopen = 3
+```
+
+- 保持充足的文件描述符上限
+- 请求频繁，将短连接改用长连接
+- TIME_WAIT的优化
+  - 使用端口复用
+  - 限制TIME_WAIT状态的连接的最大数量
+
+# 容器网络虚拟化
+- 这一章笔记写的比较简单，具体见P273
+## veth设备对
+- 使用软件来模拟网线连接传输
+
+### veth如何使用
+- 在linux下，可以使用ip命令创建一对veth，其中link表示link layer，即链路层
+```bash
+# ip link add veth0 type veth peer name veth1
+```
+- 使用ip link show进行查看
+```bash
+# ip link add veth0 type veth peer name veth1
+# ip link show
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP mode DEFAULT qlen 1000
+    link/ether 6c:0b:84:d5:88:d1 brd ff:ff:ff:ff:ff:ff
+3: eth1: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN mode DEFAULT qlen 1000
+    link/ether 6c:0b:84:d5:88:d2 brd ff:ff:ff:ff:ff:ff
+4: veth1@veth0: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT qlen 1000
+    link/ether 4e:ac:33:e5:eb:16 brd ff:ff:ff:ff:ff:ff
+5: veth0@veth1: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT qlen 1000
+    link/ether 2a:6d:65:74:30:fb brd ff:ff:ff:ff:ff:ff
+```
+
+- 为其配置ip
+```bash
+# ip addr add 192.168.1.1/24 dev veth0
+# ip addr add 192.168.1.2/24 dev veth1
+```
+- 启动这两个设备
+```bash
+# ip link set veth0 up
+# ip link set veth1 up
+```
+- 使用ifconfig查看
+```bash
+# ifconfig
+eth0: ......
+lo: ......
+veth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
+        inet 192.168.1.1  netmask 255.255.255.0  broadcast 0.0.0.0
+        ......
+veth1: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
+        inet 192.168.1.2  netmask 255.255.255.0  broadcast 0.0.0.0
+        ......
+```
+- 现在，一对虚拟设备就建立起来了
+- 之后需要进行一些准备工作才能通信：关闭反向过滤rp_filter、打开accept_local等（P275）
+  
+### veth底层创建过程（P276）
+### veth网络通信过程
+- 基于veth的网络IO过程和图本机网络通信过程完全一样，只是使用的驱动程序不一样
+![img](assets.assets/10.3.png)
+- 回环设备调用高的发送函数是loopback_xmit
+- veth发送过程使用的发送函数是veth_xmit
+```
+//file: drivers/net/veth.c
+static netdev_tx_t veth_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+    struct veth_priv *priv = netdev_priv(dev);
+    struct net_device *rcv;
+
+    //获取 veth 设备的对端
+    rcv = rcu_dereference(priv->peer);
+
+    //调用 dev_forward_skb 向对端发包
+    if (likely(dev_forward_skb(rcv, skb) == NET_RX_SUCCESS)) {
+    }
+    ......
+```
+
+### 小结
+- veth和IO设备非常像，和本机网络通信的的过程一致，只是发送函数不同
+
+## 网络命名空间
+- 在Linux上实现隔离的技术手段是命名空间
+- 可以为不同的命名空间在逻辑上提供独立的网络协议栈
+![img](assets.assets/10.4.png)
+
+### 如何使用网络命名空间
+![img](assets.assets/10.5.png)
+
+### 结论
+- Linux的网络命名空间实现了多个独立的协议栈，这个说法不够准确，内核网络代码只有一套，并没有隔离。只是为不同的空间创建不同的struct net对象，每个net都有自己独立的路由表、iptables等数据结构
+- 每个设备、每个socket上也都有指明自己属于哪个网络命名空间
+- 从逻辑上看起来真的有多个协议栈一样
+
+## 虚拟交换机Bridge
+- Linux中的veth是一对能互相连接、互相通信的虚拟网卡，通过使用可以让Docker容器和母机通信，或者两个Docker容器中进行交流
+- 在物理机中，是通过交换机连载一起；在网络虚拟化环境里，实现这种交换机的技术叫做Bridge
+
+### 小结
+- 所谓网络虚拟化，就是用软件来模拟实现真实的物理网络连接
+![img](assets.assets/10.28.jpg)
+
+## 外部网络通信
+### iptables 与 NAT
+- iptables是一个非常常用的干预内核行为的工具，他在内核中埋下了五个钩子函数，称为五链
+![img](assets.assets/10.31.png)
 
 
