@@ -11,7 +11,8 @@
 | C++ Primer | ✔ |
 | Effective C++ | ✔ |
 | 程序员的自我修养 | - |
-| 深入理解Linux网络 | ing... | 
+| 深入理解Linux网络 | ✔ | 
+| Linux 内核设计与实现 | ing... |
 
 # 想读的
 | Book | Status | 
