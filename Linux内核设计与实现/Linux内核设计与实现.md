@@ -1027,6 +1027,11 @@ struct kmem_cache* kmem_cache_create(const char* name, size_t size, size_t align
 
 # 可移植性性
 
+## 字节和数据类型
+- 能够由机器一次完成处理的数据称为字
+- 处理器通用寄存器的大小和它的字长是相同的
+
+
 
 
 

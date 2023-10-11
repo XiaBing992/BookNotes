@@ -6,19 +6,19 @@
 | ✘ | 还没读 |
 
 # 状态表
-| Book | Status | 
+| Book | Status |
 | :---: | :---: |
 | C++ Primer | ✔ |
 | Effective C++ | ✔ |
 | 程序员的自我修养 | - |
-| 深入理解Linux网络 | ✔ | 
-| Linux 内核设计与实现 | ing... |
+| 深入理解Linux网络 | ✔ |
+| Linux 内核设计与实现 | ✔ |
 
 # 想读的
 | Book | Status | 
 | :---: | :---: |
-| Linux 内核设计与实现 | ✘ |
 | 汇编语言 | ✘ |
+| TCP/IP网络编程 | ✘|
 # 感觉还得在看一遍
 
 | Book | Status | 
