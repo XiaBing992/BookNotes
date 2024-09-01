@@ -2,7 +2,7 @@
  * @Author: wxb 1763567512@qq.com
  * @Date: 2024-07-08 22:30:37
  * @LastEditors: wxb 1763567512@qq.com
- * @LastEditTime: 2024-08-30 12:01:04
+ * @LastEditTime: 2024-08-31 20:59:35
  * @FilePath: \go语言设计与实现\go语言设计与实现.md
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 -->
@@ -149,7 +149,20 @@ c.(*Cat).Quack() //编译期确定
   - 从反射对象可以获取interface{}变量：通过reflect.Value.Interface
   - 要修改反射对象，其值必须可设置: Go本身是值传递，直接设置无法改变原变量
 
+# 常用关键字
+- map遍历两次可能会有不同的结果
+- 对于range循环，Go语言会在编译期将原切片或者数据赋值给一个新的ha，又通过len获取了长度
+- map遍历原理：随机选一个桶，之后遍历溢出桶，再按照索引遍历其他区桶
+- string遍历：遍历时拿到的数据类型是rune(type int32 rune)
 
+## select
+- 当不存在可以收发的channel时，执行default
+- 遇到多种情况会随机执行一种
+
+### 原理
+- select语句在编译期间会被转换成oselect节点
+
+## defer
 
 
 # Other
