@@ -2,7 +2,7 @@
  * @Author: wxb 1763567512@qq.com
  * @Date: 2024-07-08 22:30:37
  * @LastEditors: wxb 1763567512@qq.com
- * @LastEditTime: 2024-08-31 20:59:35
+ * @LastEditTime: 2024-09-05 00:44:58
  * @FilePath: \go语言设计与实现\go语言设计与实现.md
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 -->
@@ -163,7 +163,23 @@ c.(*Cat).Quack() //编译期确定
 - select语句在编译期间会被转换成oselect节点
 
 ## defer
-
+- 用于关闭描述符、数据库以及解锁资源
+- 只会在函数结束时调用，不会在作用域结束时调用
+- 在声明处参数就传过去了
+- 每个runtime._defer都是延迟调用链表上的一个元素
+```go
+type _defer struct {
+	siz       int32 // 参数和结果的内存大小
+	started   bool
+	openDefer bool
+	sp        uintptr
+	pc        uintptr
+	fn        *funcval // 传入的函数
+	_panic    *_panic
+	link      *_defer
+}
+```
+![](assets.assets/2024-09-05-00-47-41.png)
 
 # Other
 - go中的引用类型：slice、map、interface{}、func、channel
