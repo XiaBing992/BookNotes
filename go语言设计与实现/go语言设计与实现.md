@@ -2,7 +2,7 @@
  * @Author: wxb 1763567512@qq.com
  * @Date: 2024-07-08 22:30:37
  * @LastEditors: wxb 1763567512@qq.com
- * @LastEditTime: 2024-09-05 00:44:58
+ * @LastEditTime: 2024-09-17 23:31:02
  * @FilePath: \go语言设计与实现\go语言设计与实现.md
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 -->
@@ -180,6 +180,30 @@ type _defer struct {
 }
 ```
 ![](assets.assets/2024-09-05-00-47-41.png)
+
+## panic和recover
+- panic只会触发当前goroutine的defer
+- recover只有在defer中调用才会生效
+- panic允许在defer中嵌套多次调用
+- 在执行过程中遇到panic方法，会从Goroutine的链表依次取出runtime._defer结构体并执行
+- 如果遇到recover，就会执行
+- 当所有defer执行完毕，就会返回错误码2
+
+## make 和 new
+- make用于初始化内置数据结构，如slice、map、channel
+- new用于根据类型分配一块内存空间，并返回这个内存空间的指针
+
+# 并发编程
+
+## 上下文
+- context.Context主要实现了4个所需要的方法：
+  - Deadline：返回上下文被取消的时间
+  - Done：返回一个Channel
+  - Err：返回上下文结束的原因
+  - Value：获取键对应的值
+
+### 设计原理
+- 每个context都会从顶部的goroutine传递到最底层
 
 # Other
 - go中的引用类型：slice、map、interface{}、func、channel
