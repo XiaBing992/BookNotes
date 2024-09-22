@@ -2,7 +2,7 @@
  * @Author: wxb 1763567512@qq.com
  * @Date: 2024-07-08 22:30:37
  * @LastEditors: wxb 1763567512@qq.com
- * @LastEditTime: 2024-09-17 23:31:02
+ * @LastEditTime: 2024-09-22 16:25:07
  * @FilePath: \go语言设计与实现\go语言设计与实现.md
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 -->
@@ -201,9 +201,31 @@ type _defer struct {
   - Done：返回一个Channel
   - Err：返回上下文结束的原因
   - Value：获取键对应的值
+- 用于goroutine组成的树中同步取消信号
+- 使用context传递请求的参数是一种差的设计，但是经常用这个传递分布式追踪的id
 
 ### 设计原理
 - 每个context都会从顶部的goroutine传递到最底层
+
+## 同步原语与锁
+
+### 基本原语
+#### Mutex
+```go
+type Mutex struct{
+  state int32 // 互斥锁状态
+  sema uint32 // 信号
+}
+```
+- 正常模式：等待锁的按照FIFO和新请求的goroutine竞争锁
+- 饥饿模式：互斥锁直接交给最队列前面的Goroutine
+- 当前goroutine等待锁的时间超过1ms就会切换到饥饿模式
+- 互斥锁上是最后一个等待的协程后者等待时间少于1ms就会切换回正常模式
+##### 状态
+- state中的最低3位分别表示mutexLocked、mutexWoken、mutexStarving，剩余位置表示当前有多少goroutine等待互斥锁释放
+![](assets.assets/2024-09-22-16-21-13.png)
+
+
 
 # Other
 - go中的引用类型：slice、map、interface{}、func、channel
